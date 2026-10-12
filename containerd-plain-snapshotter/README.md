@@ -163,6 +163,8 @@ plain-snapshotter register [flags] <镜像名> <rootfs路径>
 
 key 是镜像层的 chain ID，value 是 rootfs 目录的绝对路径。由 `register` 命令自动维护，一般不需要手动编辑。
 
+如果 `config.json` 不是合法的 JSON 对象，服务启动、`register` 和需要读取它的 snapshot 操作都会报错并保留原文件，不会把它当成空配置覆盖。
+
 ## 注意事项
 
 - 容器直接读写你的 rootfs 目录，多个容器共享同一个 rootfs 时请注意数据冲突

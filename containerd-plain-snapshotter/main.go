@@ -95,6 +95,12 @@ func runRegister() {
 		log.Fatalf("rootfs path %q is not a valid directory", absPath)
 	}
 
+	// Read the config before `docker load` so a bad config fails without side effects.
+	sn, err := NewSnapshotter(*root)
+	if err != nil {
+		log.Fatalf("create snapshotter: %v", err)
+	}
+
 	log.Printf("registering docker image %s -> %s ...", imageName, absPath)
 
 	chainID, err := registerImage(*imageMetadata, imageName)
@@ -105,10 +111,6 @@ func runRegister() {
 	log.Printf("chain ID: %s", chainID)
 
 	// Save chain ID -> rootfs mapping
-	sn, err := NewSnapshotter(*root)
-	if err != nil {
-		log.Fatalf("create snapshotter: %v", err)
-	}
 	if err := sn.RegisterRootfs(chainID, absPath); err != nil {
 		log.Fatalf("register rootfs: %v", err)
 	}

@@ -3,12 +3,14 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"log"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
+	"syscall"
 	"time"
 
 	"github.com/containerd/containerd/errdefs"
@@ -37,7 +39,10 @@ func NewSnapshotter(root string) (*Snapshotter, error) {
 		root:  root,
 		snaps: make(map[string]*snapshot),
 	}
-	config := s.getConfig()
+	config, err := s.getConfig()
+	if err != nil {
+		return nil, err
+	}
 	log.Printf("[DEBUG] loaded config with %d entries", len(config))
 	for k, v := range config {
 		log.Printf("[DEBUG]   %s -> %s", k, v)
@@ -50,21 +55,42 @@ func (s *Snapshotter) configPath() string {
 }
 
 // getConfig reads the config file from disk every time (no caching).
-func (s *Snapshotter) getConfig() map[string]string {
-	config := make(map[string]string)
+// A missing file is an empty config.
+func (s *Snapshotter) getConfig() (map[string]string, error) {
 	data, err := os.ReadFile(s.configPath())
-	if err != nil {
-		return config
+	if errors.Is(err, os.ErrNotExist) {
+		return map[string]string{}, nil
 	}
-	json.Unmarshal(data, &config)
-	return config
+	if err != nil {
+		return nil, fmt.Errorf("read %s: %w", s.configPath(), err)
+	}
+	var config map[string]string
+	if err := json.Unmarshal(data, &config); err != nil {
+		return nil, fmt.Errorf("parse %s: %w", s.configPath(), err)
+	}
+	if config == nil {
+		return nil, fmt.Errorf("parse %s: not a JSON object", s.configPath())
+	}
+	return config, nil
 }
 
 // RegisterRootfs adds a chain ID → rootfs mapping and persists it atomically.
 func (s *Snapshotter) RegisterRootfs(chainID, rootfsPath string) error {
 	s.mu.Lock()
 	defer s.mu.Unlock()
-	config := s.getConfig()
+	// s.mu only covers this process; concurrent `register` runs share the file lock.
+	lock, err := os.OpenFile(filepath.Join(s.root, "config.lock"), os.O_CREATE|os.O_RDWR, 0600)
+	if err != nil {
+		return fmt.Errorf("open config lock: %w", err)
+	}
+	defer lock.Close()
+	if err := syscall.Flock(int(lock.Fd()), syscall.LOCK_EX); err != nil {
+		return fmt.Errorf("lock config: %w", err)
+	}
+	config, err := s.getConfig()
+	if err != nil {
+		return err
+	}
 	config[chainID] = rootfsPath
 	data, err := json.MarshalIndent(config, "", "  ")
 	if err != nil {
@@ -84,25 +110,32 @@ func (s *Snapshotter) RegisterRootfs(chainID, rootfsPath string) error {
 		os.Remove(tmpPath)
 		return err
 	}
-	return os.Rename(tmpPath, s.configPath())
+	if err := os.Rename(tmpPath, s.configPath()); err != nil {
+		os.Remove(tmpPath)
+		return err
+	}
+	return nil
 }
 
 // configuredRootfs returns the rootfs path if the key is registered in config.
 // Handles namespaced keys like "moby/2/sha256:abc..." by also checking the
 // bare chain ID ("sha256:abc...").
-func (s *Snapshotter) configuredRootfs(key string) (string, bool) {
-	config := s.getConfig()
+func (s *Snapshotter) configuredRootfs(key string) (string, bool, error) {
+	config, err := s.getConfig()
+	if err != nil {
+		return "", false, err
+	}
 	if p, ok := config[key]; ok {
-		return p, true
+		return p, true, nil
 	}
 	// Strip namespace prefix (e.g. "moby/2/") and retry
 	if i := strings.LastIndex(key, "/sha256:"); i >= 0 {
 		bare := key[i+1:]
 		if p, ok := config[bare]; ok {
-			return p, true
+			return p, true, nil
 		}
 	}
-	return "", false
+	return "", false, nil
 }
 
 func (s *Snapshotter) Stat(ctx context.Context, key string) (snapshots.Info, error) {
@@ -115,7 +148,11 @@ func (s *Snapshotter) Stat(ctx context.Context, key string) (snapshots.Info, err
 	}
 
 	// Check persistent config (for surviving restarts)
-	if _, ok := s.configuredRootfs(key); ok {
+	_, ok, err := s.configuredRootfs(key)
+	if err != nil {
+		return snapshots.Info{}, err
+	}
+	if ok {
 		log.Printf("[DEBUG] Stat(%q) -> found in config", key)
 		return snapshots.Info{
 			Name:    key,
@@ -166,7 +203,11 @@ func (s *Snapshotter) Mounts(ctx context.Context, key string) ([]mount.Mount, er
 		log.Printf("[DEBUG] Mounts(%q) -> memory rootfs=%s", key, sn.rootfs)
 		return bindMount(sn.rootfs), nil
 	}
-	if rootfs, ok := s.configuredRootfs(key); ok {
+	rootfs, ok, err := s.configuredRootfs(key)
+	if err != nil {
+		return nil, err
+	}
+	if ok {
 		log.Printf("[DEBUG] Mounts(%q) -> config rootfs=%s", key, rootfs)
 		return bindMount(rootfs), nil
 	}
@@ -197,22 +238,23 @@ func (s *Snapshotter) createSnapshot(ctx context.Context, kind snapshots.Kind, k
 	for _, opt := range opts {
 		opt(&base)
 	}
-	// Determine rootfs: config(parent) > parent's stored rootfs > temp dir
-	rootfs := ""
-	source := "none"
+	// Determine rootfs: config(parent) > parent's stored rootfs; no parent gets a temp dir
+	var rootfs, source string
 	if parent != "" {
-		if r, ok := s.configuredRootfs(parent); ok {
+		r, ok, err := s.configuredRootfs(parent)
+		if err != nil {
+			return nil, err
+		}
+		if ok {
 			rootfs = r
 			source = "config"
-		}
-	}
-	if rootfs == "" && parent != "" {
-		if p, ok := s.snaps[parent]; ok {
+		} else if p, ok := s.snaps[parent]; ok {
 			rootfs = p.rootfs
 			source = "parent"
+		} else {
+			return nil, fmt.Errorf("parent snapshot %q: %w", parent, errdefs.ErrNotFound)
 		}
-	}
-	if rootfs == "" {
+	} else {
 		dir, err := os.MkdirTemp(s.root, "snap-")
 		if err != nil {
 			return nil, fmt.Errorf("create temp dir: %w", err)
@@ -278,7 +320,10 @@ func (s *Snapshotter) Walk(ctx context.Context, fn snapshots.WalkFunc, filters .
 	s.mu.RLock()
 	defer s.mu.RUnlock()
 
-	config := s.getConfig()
+	config, err := s.getConfig()
+	if err != nil {
+		return err
+	}
 	log.Printf("[DEBUG] Walk(filters=%v) snaps=%d config=%d", filters, len(s.snaps), len(config))
 
 	for _, sn := range s.snaps {
